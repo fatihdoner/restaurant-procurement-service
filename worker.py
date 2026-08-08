@@ -93,7 +93,11 @@ def process_menu(db, menu: Menu):
 
                 for ing in item["ingredients"]:
                     candidates = [i.canonical_name for i in db.query(Ingredient).limit(20)]
-                    norm = normalize_ingredient(ing["raw_text"], candidates)
+                    try:
+                        norm = normalize_ingredient(ing["raw_text"], candidates)
+                    except Exception as e:
+                        print(f"Normalization atlandi ({ing['raw_text']}): {e}")
+                        norm = {"canonical_name": "NEW", "confidence": 0}
                     canonical_name = norm["canonical_name"]
                     confidence = norm["confidence"]
 
