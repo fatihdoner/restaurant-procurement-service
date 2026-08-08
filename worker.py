@@ -65,7 +65,11 @@ def process_menu(db, menu: Menu):
             if not page_text.strip():
                 continue  # boş sayfa (görsel ağırlıklı olabilir) — v2'de vision fallback eklenecek
 
-            items = extract_menu_page(page_text, page_number)
+            try:
+                items = extract_menu_page(page_text, page_number)
+            except Exception as e:
+                print(f"Sayfa {page_number} atlandi, hata: {e}")
+                continue
 
             for item in items:
                 item = self_check_source_fidelity(item)
