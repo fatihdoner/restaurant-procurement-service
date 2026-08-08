@@ -78,7 +78,7 @@ def normalize_ingredient(raw_text: str, candidate_ingredients: list[str]) -> dic
     ])
     response = client.messages.create(
         model=MODEL,
-        max_tokens=200,
+        max_tokens=1024,
         messages=[{"role": "user", "content": prompt}],
     )
     raw = get_text_from_response(response).replace("```json", "").replace("```", "").strip()
