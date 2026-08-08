@@ -5,6 +5,7 @@ import uuid
 
 from fastapi import FastAPI, UploadFile, Depends, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import Session
 
 from app.db import get_session, Menu, Restaurant
