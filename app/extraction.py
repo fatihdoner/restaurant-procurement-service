@@ -45,7 +45,7 @@ def get_text_from_response(response) -> str:
 def extract_menu_page(page_text: str, page_number: int) -> list[dict]:
     response = client.messages.create(
         model=MODEL,
-        max_tokens=4000,
+        max_tokens=8000,
         system=EXTRACTION_SYSTEM_PROMPT,
         messages=[{"role": "user", "content": "Sayfa " + str(page_number) + " metni:\n\n" + page_text}],
     )
