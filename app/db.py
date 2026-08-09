@@ -46,4 +46,10 @@ class Menu(Base):
     source_file_url = Column(Text, nullable=False)
     source_file_name = Column(Text)
     version_number = Column(Integer, default=1)
-    status =
+    status = Column(Text, default="pending")
+    uploaded_at = Column(DateTime, default=datetime.utcnow)
+
+
+class MenuSection(Base):
+    __tablename__ = "menu_sections"
+    id = Column(UUID(as
