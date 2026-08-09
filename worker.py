@@ -1,26 +1,22 @@
 """
-Worker process — Railway/Render'da AYRI bir servis olarak çalıştırılır
-(web servisinden ayrı, çünkü extraction birkaç dakika sürebilir).
-
-Basit DB tabanlı polling kullanıyoruz (Redis/BullMQ gibi ekstra bir
-altyapıya MVP ölçeğinde gerek yok). menus.status = 'pending' olan
-kayıtları bulur, işler, sonucu yazar.
-
-Çalıştırma: python worker.py
+Worker process - Railway'de web servisiyle ayni process icinde,
+background thread olarak calisir.
 """
 
 import time
 import traceback
+from difflib import SequenceMatcher
 
-import fitz  # PyMuPDF
+import fitz
 
 from app.db import (SessionLocal, Menu, MenuSection, MenuItem, Ingredient,
                      IngredientAlias, MenuItemIngredient, AnalysisRun,
                      ExtractionReview)
 from app.extraction import (extract_menu_page, self_check_source_fidelity,
-                             normalize_ingredient, MODEL, CONFIDENCE_THRESHOLD)
+                             MODEL, CONFIDENCE_THRESHOLD)
 
 POLL_INTERVAL_SECONDS = 10
+FUZZY_MATCH_THRESHOLD = 0.82
 
 
 def pdf_to_pages_text(local_pdf_path: str) -> list[str]:
@@ -28,13 +24,27 @@ def pdf_to_pages_text(local_pdf_path: str) -> list[str]:
     return [page.get_text() for page in doc]
 
 
-def find_or_create_ingredient(db, canonical_name: str, raw_text: str, confidence: float):
-    """Basit alias lookup + insert. Production'da bunun yerine pgvector
-    similarity search kullanılmalı (bkz. tasarım dokümanı madde 6) —
-    burada MVP için exact/alias-table lookup yeterli."""
+def fuzzy_normalize(raw_text: str, canonical_names: list[str]):
+    raw_norm = raw_text.strip().lower()
+    best_match = None
+    best_score = 0.0
+    for name in canonical_names:
+        score = SequenceMatcher(None, raw_norm, name.lower()).ratio()
+        if score > best_score:
+            best_score = score
+            best_match = name
+    if best_match and best_score >= FUZZY_MATCH_THRESHOLD:
+        return best_match, round(best_score * 100, 2)
+    return raw_text.strip().title(), 0.0
+
+
+def find_or_create_ingredient(db, raw_text: str):
     alias = db.query(IngredientAlias).filter_by(alias_text=raw_text.strip().lower()).first()
     if alias:
-        return alias.ingredient_id, alias.confidence_score
+        return alias.ingredient_id, float(alias.confidence_score)
+
+    existing = db.query(Ingredient).all()
+    canonical_name, confidence = fuzzy_normalize(raw_text, [i.canonical_name for i in existing])
 
     ingredient = db.query(Ingredient).filter_by(canonical_name=canonical_name).first()
     if not ingredient:
@@ -58,12 +68,12 @@ def process_menu(db, menu: Menu):
     db.commit()
 
     try:
-        pages = pdf_to_pages_text(menu.source_file_url)  # local path veya indirilmiş dosya
-        section_cache = {}  # section adı -> MenuSection.id
+        pages = pdf_to_pages_text(menu.source_file_url)
+        section_cache = {}
 
         for page_number, page_text in enumerate(pages, start=1):
             if not page_text.strip():
-                continue  # boş sayfa (görsel ağırlıklı olabilir) — v2'de vision fallback eklenecek
+                continue
 
             try:
                 items = extract_menu_page(page_text, page_number)
@@ -92,20 +102,11 @@ def process_menu(db, menu: Menu):
                 db.flush()
 
                 for ing in item["ingredients"]:
-                    candidates = [i.canonical_name for i in db.query(Ingredient).limit(20)]
                     try:
-                        norm = normalize_ingredient(ing["raw_text"], candidates)
+                        ingredient_id, confidence = find_or_create_ingredient(db, ing["raw_text"])
                     except Exception as e:
                         print(f"Normalization atlandi ({ing['raw_text']}): {e}")
-                        norm = {"canonical_name": "NEW", "confidence": 0}
-                    canonical_name = norm["canonical_name"]
-                    confidence = norm["confidence"]
-
-                    ingredient_id = None
-                    if canonical_name != "NEW":
-                        ingredient_id, confidence = find_or_create_ingredient(
-                            db, canonical_name, ing["raw_text"], confidence
-                        )
+                        ingredient_id, confidence = None, 0.0
 
                     mii = MenuItemIngredient(
                         menu_item_id=menu_item.id,
@@ -147,16 +148,19 @@ def _parse_price(price_str):
 
 
 def main_loop():
-    print(f"Worker başladı. Model: {MODEL}. Poll interval: {POLL_INTERVAL_SECONDS}s")
+    print(f"Worker basladi. Model: {MODEL}. Poll interval: {POLL_INTERVAL_SECONDS}s")
     while True:
         db = SessionLocal()
         try:
             pending = db.query(Menu).filter_by(status="pending").first()
             if pending:
-                print(f"İşleniyor: menu_id={pending.id}")
+                print(f"Isleniyor: menu_id={pending.id}")
                 process_menu(db, pending)
             else:
                 time.sleep(POLL_INTERVAL_SECONDS)
+        except Exception as e:
+            print(f"main_loop hatasi (worker devam ediyor): {e}")
+            time.sleep(POLL_INTERVAL_SECONDS)
         finally:
             db.close()
 
