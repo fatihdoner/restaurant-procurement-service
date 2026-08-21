@@ -48,4 +48,48 @@ def create_restaurant(
     restaurant_type: str = "",
     db: Session = Depends(get_session),
 ):
-    # Tek cagriyla restoran + (gerekirse)
+    # Tek cagriyla restoran + (gerekirse) marka olusturur.
+    # Ayni brand_name daha once varsa yeniden kullanir
+
+# ------------------------------------------------------------------
+# Urun portfoyu yonetimi (Yayla veya herhangi baska bir marka)
+# ------------------------------------------------------------------
+@app.post("/products")
+def create_product(name: str, brand: str, sub_category: str = "", db: Session = Depends(get_session)):
+    product = Product(name=name, brand=brand, sub_category=sub_category)
+    db.add(product)
+    db.commit()
+    db.refresh(product)
+    return {"product_id": product.id, "name": product.name, "brand": product.brand}
+
+
+@app.post("/products/bulk")
+def create_products_bulk(brand: str, names: list[str], db: Session = Depends(get_session)):
+    # Tek cagriyla bir markanin tum urun listesini ekler.
+    # Ornek govde: {"brand": "Yayla", "names": ["BASMATİ PİRİNÇ", "CHİA", ...]}
+    created = []
+    for name in names:
+        existing =
+
+from difflib import SequenceMatcher
+
+FUZZY_IMPORT_THRESHOLD = 0.82
+
+
+def _split_ingredients_raw(desc: str):
+    desc = str(desc).strip()
+    desc = re.sub(r"\s*(ile\.?)$", "", desc, flags=re.IGNORECASE)
+    desc = desc.replace(";", ",")
+    parts = re.split(r",|\.", desc)
+    return [p.strip() for p in parts if p.strip() and len(p.strip()) > 1]
+
+
+def _fuzzy_normalize_import(raw: str, pool: list):
+    raw_norm = raw.strip().lower()
+    best_score, best_name = 0.0, None
+    for name in pool:
+        score = SequenceMatcher(None, raw_norm, name.lower()).ratio()
+        if score > best_score:
+            best_score, best_name = score, name
+    if best_score >= FUZZY_IMPORT_THRESHOLD:
+        return best_name,
