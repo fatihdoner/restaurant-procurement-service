@@ -24,10 +24,7 @@ UPLOAD_DIR = os.environ.get("UPLOAD_DIR", "/data/uploads")
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 
 
-@app.on_event("startup")
-def start_worker_thread():
-    from worker import main_loop
-    threading.Thread(target=main_loop, daemon=True).start()
+@app.on_event("startup") def start_worker_thread(): if os.getenv("WORKER_ENABLED", "true").lower() == "true": from worker import main_loop threading.Thread(target=main_loop, daemon=True).start()
 
 
 @app.get("/health")
