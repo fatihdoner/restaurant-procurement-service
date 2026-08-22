@@ -26,9 +26,16 @@ os.makedirs(UPLOAD_DIR, exist_ok=True)
 
 @app.on_event("startup")
 def start_worker_thread():
-    if os.getenv("WORKER_ENABLED", "true").lower() == "true":
+    flag = os.getenv("WORKER_ENABLED", "true").lower()
+    print(f"DEBUG: WORKER_ENABLED okunan deger = '{flag}'")
+    if flag == "true":
         from worker import main_loop
-        threading.Thread(target=main_loop, daemon=True).start()
+        print("DEBUG: main_loop import edildi, thread baslatiliyor")
+        t = threading.Thread(target=main_loop, daemon=True)
+        t.start()
+        print(f"DEBUG: thread baslatildi, alive={t.is_alive()}")
+    else:
+        print("DEBUG: WORKER_ENABLED false, thread BASLATILMADI")
 
 
 @app.get("/health")
