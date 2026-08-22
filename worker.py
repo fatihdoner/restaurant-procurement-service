@@ -153,8 +153,9 @@ def _parse_price(price_str):
 def main_loop():
     print(f"Worker basladi. Model: {MODEL}. Poll interval: {POLL_INTERVAL_SECONDS}s")
     while True:
-        db = SessionLocal()
+        db = None
         try:
+            db = SessionLocal()
             pending = db.query(Menu).filter_by(status="pending").first()
             if pending:
                 print(f"Isleniyor: menu_id={pending.id}")
@@ -165,7 +166,8 @@ def main_loop():
             print(f"main_loop hatasi (worker devam ediyor): {e}")
             time.sleep(POLL_INTERVAL_SECONDS)
         finally:
-            db.close()
+            if db is not None:
+                db.close()
 
 
 if __name__ == "__main__":
