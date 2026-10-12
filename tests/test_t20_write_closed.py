@@ -8,7 +8,9 @@ Degiskenler yoksa/uyusmuyorsa test BASLAMAZ (atlanmaz, basarisiz olur).
 
 Calistirma (repo kokunden):  python3 -m unittest tests.test_t20_write_closed -v
 Gereksinim: requirements.txt + httpx (Starlette TestClient icin; uretim imajina eklenmez).
-Isteğe bagli: RPS_T20_EVIDENCE_DIR -> http_log.jsonl, cors_probe.json, isolation.json, summary.json
+Isteğe bagli: RPS_T20_EVIDENCE_DIR -> http_log.jsonl, cors_probe.json, isolation.json, summary.json,
+  side_effects.json (+ side_effects_summary.txt): reddedilen istekler icin 12 tablo onceki/sonraki parmak izi,
+  sifir baglanti, sifir dosya degisikligi (Z1 testi diske yazar, geri okur ve dogrular)
 
 Bu testler T-20'nin TAMAMINI kanitlamaz: rate limit yok (R0), uretim dogrulamasi yok.
 """
@@ -39,10 +41,14 @@ FOREIGN_ORIGIN = "https://evil.example"
 SAFE = {"GET", "HEAD", "OPTIONS"}
 DENIED_JSON = {"detail": "write_endpoints_closed"}
 PROBE = "T20PROBE"
+BRAND = "SyntheticBrand_X"  # F-01: tamamen sentetik marka adi (gercek marka yok)
 
 G = {}
 HTTP_LOG = []
 NET = {"violations": [], "expected": []}
+RECORDS = []   # F-02: reddedilen istek bloklari icin kalici kanit kayitlari
+CONTROLS = []  # F-02: dedektor kontrolleri (yamasiz uygulama yazar -> parmak izi degisir)
+REQ = {"n": 0}  # her HTTP istegi (TestClient, ham ASGI, ham TCP) icin sayac
 
 
 # --------------------------------------------------------------------------- module setup
@@ -223,8 +229,8 @@ def _seed(dbm):
         s.flush()
         s.add(dbm.IngredientAlias(ingredient_id=ing.id, alias_text="sut", source="seed", confidence_score=99))
         s.add(dbm.MenuItemIngredient(menu_item_id=item.id, ingredient_id=ing.id, raw_text="sut", extraction_type="explicit", confidence_score=99))
-        s.add(dbm.Product(brand="Yayla", name="Sut"))
-        s.add(dbm.Product(brand="Yayla", name="Peynir"))
+        s.add(dbm.Product(brand=BRAND, name="Sut"))
+        s.add(dbm.Product(brand=BRAND, name="Peynir"))
         s.commit()
         G["ids"] = {"restaurant": rest.id, "menu": menu.id}
 
@@ -250,7 +256,7 @@ def tearDownModule():
             (d / "isolation.json").write_text(json.dumps(dict(G.get("isolation", {}), network_probe_hosts_blocked=sorted(set(NET["violations"])),
                                                               tables_fingerprinted=G.get("tables"), startup_logs=G.get("startup")),
                                                          indent=1, sort_keys=True), encoding="utf-8")
-            (d / "summary.json").write_text(json.dumps({"http_requests_logged": len(HTTP_LOG), "app_connections_total": G.get("conn")}, indent=1), encoding="utf-8")
+            (d / "summary.json").write_text(json.dumps({"http_requests_logged": len(HTTP_LOG), "app_connection_events_since_last_reset": G.get("conn")}, indent=1), encoding="utf-8")
         if problems:
             raise AssertionError("; ".join(problems))
     finally:
@@ -281,6 +287,7 @@ def send(label, method, path, origin=None, headers=None, **kw):
     h = dict(headers or {})
     if origin is not None:
         h["Origin"] = origin
+    REQ["n"] += 1
     r = G["clients"][label].request(method, path, headers=h, **kw)
     HTTP_LOG.append({"app": label, "method": method, "path": path.split("?")[0], "origin": origin, "status": r.status_code,
                      "acao": r.headers.get("access-control-allow-origin"),
@@ -312,6 +319,18 @@ def listing(p):
     return sorted(str(x.relative_to(p)) for x in Path(p).rglob("*"))
 
 
+def fp_json(fp):
+    """Parmak izini JSON'a cevirir: {tablo: [satir_sayisi, icerik_md5]} + __public_table_count__."""
+    return {k: (list(v) if isinstance(v, tuple) else v) for k, v in fp.items()}
+
+
+def pg_backends():
+    """Sunucu tarafi capraz kontrol: bu test veritabanina bagli istemci backend sayisi."""
+    cur = G["admin_conn"].cursor()
+    cur.execute("select count(*) from pg_stat_activity where datname = %s and backend_type = 'client backend'", (G["dbname"],))
+    return cur.fetchone()[0]
+
+
 def _forbidden_session():
     G["forbidden_calls"] = G.get("forbidden_calls", 0) + 1
     raise AssertionError("get_session was reached: a DB session would have been opened")
@@ -326,9 +345,12 @@ def _forbidden_sessionlocal(*a, **kw):
 @contextlib.contextmanager
 def no_side_effects(tc, labels=("default",)):
     """Blok boyunca: DB parmak izi, yukleme dizinleri, sistem tmp dizini degismez; get_session /
-    SessionLocal cagrilirsa ve uygulama motoru hic baglanti acarsa test duser."""
+    SessionLocal cagrilirsa ve uygulama motoru hic baglanti acarsa test duser.
+    F-02: onceki/sonraki degerler RECORDS'a yazilir (Z1 testi diske yazip dogrular)."""
     dbm = G["dbm"]
     before = (fingerprint(), {l: listing(G["uploads"][l]) for l in labels}, listing(G["sys_tmp"]))
+    backends_before = pg_backends()
+    req0 = REQ["n"]
     G["conn"].update(connect=0, checkout=0)
     G["forbidden_calls"] = 0
     for l in labels:
@@ -342,11 +364,18 @@ def no_side_effects(tc, labels=("default",)):
         for l in labels:
             G["mods"][l].app.dependency_overrides.pop(dbm.get_session, None)
     after = (fingerprint(), {l: listing(G["uploads"][l]) for l in labels}, listing(G["sys_tmp"]))
+    rec = {"test": type(tc).__name__ + "." + tc._testMethodName, "apps": list(labels), "requests": REQ["n"] - req0,
+           "db_before": fp_json(before[0]), "db_after": fp_json(after[0]),
+           "uploads_before": before[1], "uploads_after": after[1], "sys_tmp_before": before[2], "sys_tmp_after": after[2],
+           "app_connections": dict(G["conn"]), "forbidden_session_calls": G["forbidden_calls"],
+           "pg_backends_before": backends_before, "pg_backends_after": pg_backends()}
+    RECORDS.append(rec)
     tc.assertEqual(before[0], after[0], "DB rows changed")
     tc.assertEqual(before[1], after[1], "a persistent upload file was created/changed")
     tc.assertEqual(before[2], after[2], "request body was spooled to disk")
     tc.assertEqual(G["forbidden_calls"], 0, "a DB session was requested")
     tc.assertEqual(G["conn"], {"connect": 0, "checkout": 0}, "the application engine opened/checked out a connection")
+    tc.assertEqual(rec["pg_backends_before"], rec["pg_backends_after"], "the database server saw a new client backend")
 
 
 def write_cases(tag=PROBE):
@@ -473,8 +502,13 @@ class N3_DbUntouchedAndDetectorWorks(unittest.TestCase):
                 before = fingerprint(conn)
                 r = send("baseline", m, p, **kw)
                 after = fingerprint(conn)
+                CONTROLS.append({"case": name, "status": r.status_code, "db_before": fp_json(before), "db_after": fp_json(after),
+                                 "db_changed": before != after,
+                                 "tables_changed": sorted(k for k in before if before[k] != after[k])})
                 self.assertEqual(r.status_code, 200, name)
                 self.assertNotEqual(before, after, "detector failed to see an unguarded write: " + name)
+            CONTROLS.append({"case": "upload file on disk (baseline)", "uploads_before": up_before, "uploads_after": listing(up),
+                             "db_changed": True, "file_changed": listing(up) != up_before})
             self.assertNotEqual(listing(up), up_before, "detector failed to see the unguarded upload file")
         finally:
             app.dependency_overrides.pop(dbm.get_session, None)
@@ -512,6 +546,7 @@ def _run_asgi(app, scope, receive=None):
     async def send_(msg):
         sent.append(msg)
 
+    REQ["n"] += 1
     rcv = receive or _CountingReceive()
     loop = asyncio.new_event_loop()
     try:
@@ -531,13 +566,14 @@ class N4_NoBodyReadNoPersistentFile(unittest.TestCase):
 
     def test_asgi_receive_is_never_called_through_the_full_stack(self):
         app = G["mods"]["default"].app
-        for name, m, p, kw in write_cases():
-            hdrs = {"content-type": "multipart/form-data; boundary=x", "content-length": str(5 * 1024 * 1024)}
-            sent, rcv = _run_asgi(app, _http_scope(m, p, hdrs))
-            self.assertEqual(rcv.calls, 0, name + ": request body was read")
-            self.assertEqual([s["type"] for s in sent], ["http.response.start", "http.response.body"])
-            self.assertEqual(sent[0]["status"], 403)
-            self.assertEqual(json.loads(sent[1]["body"]), DENIED_JSON)
+        with no_side_effects(self, ("default",)):
+            for name, m, p, kw in write_cases():
+                hdrs = {"content-type": "multipart/form-data; boundary=x", "content-length": str(5 * 1024 * 1024)}
+                sent, rcv = _run_asgi(app, _http_scope(m, p, hdrs))
+                self.assertEqual(rcv.calls, 0, name + ": request body was read")
+                self.assertEqual([s["type"] for s in sent], ["http.response.start", "http.response.body"])
+                self.assertEqual(sent[0]["status"], 403)
+                self.assertEqual(json.loads(sent[1]["body"]), DENIED_JSON)
 
 
 class N4b_LiveUvicornServer(unittest.TestCase):
@@ -566,6 +602,7 @@ class N4b_LiveUvicornServer(unittest.TestCase):
     def raw(self, head, body_chunks):
         """Basligi ve (sinirli) govdeyi gonderir, yaniti ayri bir thread'de okur. Sunucu govdeyi okumadan
         yanit verip baglantiyi kapatabildigi icin (RST) yanit kacirilirsa en fazla 3 deneme yapilir."""
+        REQ["n"] += 1
         for attempt in range(3):
             s = socket.create_connection(("127.0.0.1", self.port), timeout=5)
             buf = []
@@ -721,9 +758,9 @@ class N6_CorsIsNotAuthAndHasNoWildcard(unittest.TestCase):
         # GET + yontem-gecersiz kilma basligi: yalnizca okur (DB oturumu burada gerekli, blok disinda)
         for lbl in ("default", "allow"):
             before = fingerprint()
-            g = send(lbl, "GET", "/products", headers={"X-HTTP-Method-Override": "POST"}, params={"brand": "Yayla"})
+            g = send(lbl, "GET", "/products", headers={"X-HTTP-Method-Override": "POST"}, params={"brand": BRAND})
             self.assertEqual(g.status_code, 200)
-            self.assertTrue(all(x["brand"] == "Yayla" for x in g.json()))
+            self.assertTrue(all(x["brand"] == BRAND for x in g.json()))
             self.assertEqual(before, fingerprint())
 
 
@@ -747,10 +784,10 @@ class N7_ThrottledStatusIsNeverRewritten(unittest.TestCase):
 class N8_GetBehaviourPreserved(unittest.TestCase):
     def paths(self):
         mid = G["ids"]["menu"]
-        return ["/health", "/restaurants", "/restaurants?district=Kadikoy", "/restaurants?district=Yok", "/products", "/products?brand=Yayla",
+        return ["/health", "/restaurants", "/restaurants?district=Kadikoy", "/restaurants?district=Yok", "/products", "/products?brand=" + BRAND,
                 "/products/brands", "/menus/%s/status" % mid, "/menus/%s/status" % uuid.uuid4(), "/reports/ingredient-frequency",
                 "/reports/ingredient-frequency?district=Kadikoy", "/reports/ingredient-frequency?city=Istanbul",
-                "/reports/product-matching?brand=Yayla", "/reports/product-matching?brand=NoSuchBrand", "/openapi.json", "/docs", "/redoc"]
+                "/reports/product-matching?brand=" + BRAND, "/reports/product-matching?brand=NoSuchBrand", "/openapi.json", "/docs", "/redoc"]
 
     def test_get_and_head_responses_match_the_unpatched_application(self):
         for p in self.paths():
@@ -763,7 +800,7 @@ class N8_GetBehaviourPreserved(unittest.TestCase):
                     self.assertEqual(a.content, b.content)
                     self.assertEqual(a.headers.get("content-type"), b.headers.get("content-type"))
         self.assertEqual(send("default", "GET", "/health").json(), {"status": "ok"})
-        self.assertEqual(send("default", "GET", "/products/brands").json(), ["Yayla"])
+        self.assertEqual(send("default", "GET", "/products/brands").json(), [BRAND])
 
     def test_the_only_intended_header_difference_is_cors(self):
         a = send("default", "GET", "/health", origin=FOREIGN_ORIGIN)
@@ -772,7 +809,7 @@ class N8_GetBehaviourPreserved(unittest.TestCase):
         self.assertNotIn("access-control-allow-origin", a.headers)
 
     def test_reports_still_read_through_the_real_database(self):
-        r = send("default", "GET", "/reports/product-matching?brand=Yayla")
+        r = send("default", "GET", "/reports/product-matching?brand=" + BRAND)
         self.assertEqual(r.status_code, 200)
         self.assertEqual(len(r.json()["results"]), 2)
 
@@ -902,6 +939,178 @@ class X2_CorsOriginParser(unittest.TestCase):
         names = [m.cls.__name__ for m in mod.app.user_middleware]
         self.assertEqual(names, ["CORSMiddleware", "WriteGuardMiddleware"], "CORS must be outermost, guard inside")
         self.assertNotIn("allow_credentials", cors.kwargs)
+
+
+# --------------------------------------------------------------------------- F-01: sentetik fixture kontrolu
+# Gercek marka adlari bu dosyada bitisik yazilmaz (parcali birlestirme) ki kaynak taramasi kendi listesini yakalamasin.
+REAL_NAMES = ("yay" "la", "del" "ly", "fel" "las", "zu" "ber", "big" "chefs", "big" "_chefs", "mc" "donald", "burger" "king")
+
+
+class X3_SyntheticFixturesOnly(unittest.TestCase):
+    def test_no_real_brand_name_in_test_source_or_database_fixtures(self):
+        src = Path(__file__).read_text(encoding="utf-8").lower()
+        for n in REAL_NAMES:
+            self.assertNotIn(n, src, "a real brand name appears in the test source")
+        self.assertIn("syntheticbrand_x", src)
+        self.assertTrue(BRAND.startswith("Synthetic"))
+        with G["fp_engine"].connect() as c:
+            self.assertEqual([r[0] for r in c.exec_driver_sql("select distinct brand from products order by 1")], [BRAND])
+            self.assertEqual([r[0] for r in c.exec_driver_sql("select distinct name from restaurant_brands order by 1")], ["Seed Brand"])
+            for t in G["tables"]:
+                for n in REAL_NAMES:
+                    hits = c.exec_driver_sql('select count(*) from "%s" x where lower(x::text) like %%s' % t, ("%" + n + "%",)).scalar()
+                    self.assertEqual(hits, 0, "real brand name in table " + t)
+
+
+# --------------------------------------------------------------------------- F-02: kalici kanit + otomatik dogrulama
+EXPECTED_SEED = {"procurement_categories": 0, "restaurant_brands": 1, "ingredients": 1, "products": 2, "restaurants": 1,
+                 "ingredient_aliases": 1, "menus": 1, "analysis_runs": 0, "menu_sections": 1, "menu_items": 1,
+                 "menu_item_ingredients": 1, "extraction_reviews": 0}
+REQUIRED_RECORDS = {
+    "N1_FiveEndpointsRejectAnonymous.test_each_write_endpoint_returns_fixed_403",
+    "N2_MalformedBodiesRejectedUnprocessed.test_all_rejected_with_403_and_no_side_effects",
+    "N3_DbUntouchedAndDetectorWorks.test_denied_requests_leave_every_table_identical",
+    "N4_NoBodyReadNoPersistentFile.test_large_multipart_denied_before_body_is_read",
+    "N4_NoBodyReadNoPersistentFile.test_asgi_receive_is_never_called_through_the_full_stack",
+    "N4b_LiveUvicornServer.test_oversized_multipart_over_real_http_is_403_and_leaves_nothing",
+    "N4b_LiveUvicornServer.test_json_post_and_preflight_and_get_over_real_http",
+    "N5_AllWriteMethodsEverywhere.test_non_safe_methods_denied_on_every_path",
+    "N6_CorsIsNotAuthAndHasNoWildcard.test_listed_origin_does_not_authorise_a_write",
+    "N6_CorsIsNotAuthAndHasNoWildcard.test_options_cannot_be_confused_with_a_write",
+    "N7_ThrottledStatusIsNeverRewritten.test_403_for_every_origin_endpoint_and_credential_shape",
+    "N10_NoWriteRouteCanStayOpen.test_route_inventory_is_exactly_the_five_known_writers_and_all_are_closed",
+}
+
+
+def verify_side_effects(data):
+    """Diske yazilmis kaniti denetler; sorunlarin listesini dondurur (bos = kanit gecerli)."""
+    prob = []
+    tables = sorted(data.get("tables", []))
+    if tables != sorted(EXPECTED_SEED):
+        prob.append("tables: 12 beklenen tablo listelenmemis")
+    recs = data.get("records", [])
+    for missing in sorted(REQUIRED_RECORDS - {r.get("test") for r in recs}):
+        prob.append("missing record: " + missing)
+    for r in recs:
+        t = r.get("test", "?")
+        if not r.get("requests"):
+            prob.append(t + ": no requests recorded")
+        b, a = r.get("db_before", {}), r.get("db_after", {})
+        if b != a:
+            prob.append(t + ": DB fingerprint differs before/after")
+        names = sorted(k for k in b if not k.startswith("__"))
+        if names != tables or any(len(b[k]) != 2 for k in names):
+            prob.append(t + ": fingerprint does not cover the 12 tables")
+        elif {k: b[k][0] for k in names} != EXPECTED_SEED:
+            prob.append(t + ": fingerprint row counts are not the seeded state")
+        if b.get("__public_table_count__") != len(EXPECTED_SEED):
+            prob.append(t + ": public table count != 12")
+        if r.get("uploads_before") != r.get("uploads_after") or any(r.get("uploads_after", {}).values()):
+            prob.append(t + ": persistent upload file changed/created")
+        if r.get("sys_tmp_before") != r.get("sys_tmp_after") or r.get("sys_tmp_after"):
+            prob.append(t + ": request body was spooled to disk")
+        if r.get("app_connections") != {"connect": 0, "checkout": 0}:
+            prob.append(t + ": application engine opened/checked out a DB connection")
+        if r.get("forbidden_session_calls") != 0:
+            prob.append(t + ": a DB session was requested")
+        if r.get("pg_backends_before") is None or r.get("pg_backends_before") != r.get("pg_backends_after"):
+            prob.append(t + ": server-side client backend count changed")
+    ctrl = data.get("controls", [])
+    db_ctrl = [c for c in ctrl if "tables_changed" in c]
+    if len(db_ctrl) < 5 or not all(c.get("db_changed") and c.get("tables_changed") for c in db_ctrl):
+        prob.append("controls: unguarded baseline did not visibly change the DB for all 5 write cases")
+    if not any(c.get("file_changed") for c in ctrl):
+        prob.append("controls: unguarded upload file was not detected")
+    return prob
+
+
+def _write_side_effect_evidence():
+    ev = os.environ.get("RPS_T20_EVIDENCE_DIR")
+    d = Path(ev) if ev else G["tmp"] / "evidence"
+    d.mkdir(parents=True, exist_ok=True)
+    data = {"schema": 1, "tables": sorted(G["tables"]), "records": RECORDS, "controls": CONTROLS,
+            "totals": {"records": len(RECORDS), "requests_in_denied_blocks": sum(r["requests"] for r in RECORDS),
+                       "db_identical_in_all": all(r["db_before"] == r["db_after"] for r in RECORDS),
+                       "app_db_connections_in_all": sum(r["app_connections"]["connect"] + r["app_connections"]["checkout"] for r in RECORDS),
+                       "files_changed_in_any": any(r["uploads_before"] != r["uploads_after"] or r["sys_tmp_before"] != r["sys_tmp_after"] for r in RECORDS)}}
+    path = d / "side_effects.json"
+    path.write_text(json.dumps(data, indent=1, sort_keys=True), encoding="utf-8")
+    rows = ["test | requests | db identical | files identical | app conn (connect/checkout) | pg backends before/after"]
+    for r in RECORDS:
+        rows.append("%s | %d | %s | %s | %d/%d | %d/%d" % (
+            r["test"], r["requests"], r["db_before"] == r["db_after"],
+            r["uploads_before"] == r["uploads_after"] and r["sys_tmp_before"] == r["sys_tmp_after"],
+            r["app_connections"]["connect"], r["app_connections"]["checkout"], r["pg_backends_before"], r["pg_backends_after"]))
+    (d / "side_effects_summary.txt").write_text("\n".join(rows) + "\n", encoding="utf-8")
+    return path
+
+
+class Z1_PersistedEvidenceIsWrittenAndVerified(unittest.TestCase):
+    """Tum diger siniflardan sonra calisir (sinif adi siralamasi); tam modul kosusu gerektirir."""
+
+    def test_evidence_file_is_written_to_disk_and_passes_the_verifier(self):
+        path = _write_side_effect_evidence()
+        data = json.loads(path.read_text(encoding="utf-8"))  # diskten geri okunan kanit dogrulanir
+        self.assertEqual(verify_side_effects(data), [])
+        self.assertEqual(len(data["tables"]), 12)
+        self.assertGreaterEqual(data["totals"]["records"], len(REQUIRED_RECORDS))
+        self.assertTrue(data["totals"]["db_identical_in_all"])
+        self.assertEqual(data["totals"]["app_db_connections_in_all"], 0)
+        self.assertFalse(data["totals"]["files_changed_in_any"])
+        blob = (path.read_text(encoding="utf-8") + json.dumps(HTTP_LOG)).lower()
+        for n in REAL_NAMES:
+            self.assertNotIn(n, blob, "a real brand name leaked into the evidence")
+
+    def test_verifier_rejects_tampered_evidence(self):
+        import copy
+        data = json.loads(_write_side_effect_evidence().read_text(encoding="utf-8"))
+        self.assertEqual(verify_side_effects(data), [])
+        r0 = "N1_FiveEndpointsRejectAnonymous.test_each_write_endpoint_returns_fixed_403"
+
+        def rec(d):
+            return [x for x in d["records"] if x["test"] == r0][0]
+
+        def mut_rows(d):
+            rec(d)["db_after"]["products"][0] += 1
+
+        def mut_hash(d):
+            rec(d)["db_after"]["menus"][1] = "0" * 32
+
+        def mut_conn(d):
+            rec(d)["app_connections"]["connect"] = 1
+
+        def mut_checkout(d):
+            rec(d)["app_connections"]["checkout"] = 3
+
+        def mut_upload(d):
+            rec(d)["uploads_after"]["default"] = ["x.pdf"]
+
+        def mut_tmp(d):
+            rec(d)["sys_tmp_after"] = ["spool"]
+
+        def mut_session(d):
+            rec(d)["forbidden_session_calls"] = 1
+
+        def mut_backend(d):
+            rec(d)["pg_backends_after"] += 1
+
+        def mut_drop_record(d):
+            d["records"] = [x for x in d["records"] if x["test"] != r0]
+
+        def mut_drop_table(d):
+            rec(d)["db_before"].pop("menus"), rec(d)["db_after"].pop("menus")
+
+        def mut_no_requests(d):
+            rec(d)["requests"] = 0
+
+        def mut_control(d):
+            for c in d["controls"]:
+                c["db_changed"] = False
+
+        for name, f in sorted((k, v) for k, v in locals().items() if k.startswith("mut_")):
+            bad = copy.deepcopy(data)
+            f(bad)
+            self.assertNotEqual(verify_side_effects(bad), [], "verifier accepted a tampered record: " + name)
 
 
 if __name__ == "__main__":
