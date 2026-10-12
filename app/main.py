@@ -10,14 +10,18 @@ from sqlalchemy.orm import Session
 from sqlalchemy import text
 
 from app.db import get_session, Menu, Restaurant, RestaurantBrand, Product, MenuSection, MenuItem, Ingredient, IngredientAlias, MenuItemIngredient, ExtractionReview, SessionLocal
+from app.write_guard import WriteGuardMiddleware, parse_allowed_origins
 
 app = FastAPI(title="Restaurant Procurement Intelligence Platform API")
 
+# RG-0 / T-20 (R0): kimlik saglayici yok -> GET/HEAD/OPTIONS disindaki her yontem 403.
+# Guard once eklenir; CORS sonra eklenip en disa gelir. CORS kimlik dogrulama degildir.
+app.add_middleware(WriteGuardMiddleware)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_origins=parse_allowed_origins(os.environ.get("CORS_ALLOWED_ORIGINS", "")),
+    allow_methods=["GET", "HEAD", "OPTIONS"],
+    allow_headers=["Accept", "Content-Type"],
 )
 
 UPLOAD_DIR = os.environ.get("UPLOAD_DIR", "/data/uploads")
