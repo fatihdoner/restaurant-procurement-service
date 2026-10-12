@@ -1,0 +1,7 @@
+# AO-01 / A0 -- YALNIZ gelistirme/test bagimliliklari (izole venv). 
+# requirements.txt ve Dockerfile BUNU KULLANMAZ; uretim imaji bu paketleri icermez ve `app.main` bunlari iceri almaz.
+# Surumler 2026-10-12'de izole Python 3.12 venv'inde kuruldu ve sabitlendi.
+PyJWT[crypto]==2.15.1
+cryptography==50.0.2
+cffi==2.1.1
+pycparser==3.11
