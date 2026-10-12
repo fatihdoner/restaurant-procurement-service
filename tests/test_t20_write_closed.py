@@ -937,7 +937,8 @@ class X2_CorsOriginParser(unittest.TestCase):
         self.assertEqual(cors.kwargs["allow_origins"], [])
         self.assertEqual(sorted(cors.kwargs["allow_methods"]), ["GET", "HEAD", "OPTIONS"])
         names = [m.cls.__name__ for m in mod.app.user_middleware]
-        self.assertEqual(names, ["CORSMiddleware", "WriteGuardMiddleware"], "CORS must be outermost, guard inside")
+        self.assertEqual(names, ["CORSMiddleware", "WriteGuardMiddleware", "RateLimitMiddleware"],
+                         "CORS outermost, then the write guard, then the rate limiter (R1: guard stays outside so writes are always 403)")
         self.assertNotIn("allow_credentials", cors.kwargs)
 
 

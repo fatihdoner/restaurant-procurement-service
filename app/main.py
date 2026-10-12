@@ -11,11 +11,15 @@ from sqlalchemy import text
 
 from app.db import get_session, Menu, Restaurant, RestaurantBrand, Product, MenuSection, MenuItem, Ingredient, IngredientAlias, MenuItemIngredient, ExtractionReview, SessionLocal
 from app.write_guard import WriteGuardMiddleware, parse_allowed_origins
+from app.rate_limit import RateLimitMiddleware
 
 app = FastAPI(title="Restaurant Procurement Intelligence Platform API")
 
 # RG-0 / T-20 (R0): kimlik saglayici yok -> GET/HEAD/OPTIONS disindaki her yontem 403.
-# Guard once eklenir; CORS sonra eklenip en disa gelir. CORS kimlik dogrulama degildir.
+# Siralama (disaridan iceriye): CORS -> WriteGuard -> RateLimit -> uygulama. add_middleware son ekleneni
+# en disa koyar. CORS kimlik dogrulama degildir; RateLimit guard'in icindedir, bu yuzden limit dolsa bile
+# yazma yontemleri hep 403 alir (R1: GET kovasi; tek replika, istemci basina kota yok - bkz. rate_limit.py).
+app.add_middleware(RateLimitMiddleware)
 app.add_middleware(WriteGuardMiddleware)
 app.add_middleware(
     CORSMiddleware,
