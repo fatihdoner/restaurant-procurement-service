@@ -969,5 +969,170 @@ class V9_DefaultFetcher(Base):
             srv.close()
 
 
+# --------------------------------------------------------------------------- V10: R1 -- gecersiz saat (F-01) ve asiri buyuk NumericDate (F-02)
+def _verifier_with_clocks(clock, monotonic=None):
+    fetcher = FakeFetcher()
+    mono = Clk() if monotonic is None else monotonic
+    v = oidc.OidcAccessTokenVerifier(oidc.OidcConfig(**BASE_CFG), fetcher=fetcher, clock=clock, monotonic=mono)
+    return v, fetcher
+
+
+class V10_UntrustworthyClock(Base):
+    """F-01: NaN/Infinity/gecersiz saat ile, imzasi gecerli SURESI GECMIS jeton kabul ediliyordu (karsilastirmalar hep False).
+    Saat guvenilir degilse hicbir VerifiedPrincipal uretilmez; sabit kod VERIFIER_CLOCK_INVALID, HTTP 503 (jeton degil, dogrulayici sorunu)."""
+    BAD_VALUES = (float("nan"), float("inf"), float("-inf"), -1, -1.5, 0 - 10 ** 12, 4102444801, 1e300, 10 ** 400, True, False, None, "1800000000", "nan",
+                  b"1800000000", [T0], (T0,), {"t": T0}, complex(T0, 0), object())
+
+    def expired(self):
+        return mint(iat=T0 - 4000, exp=T0 - 3500)  # gecerli imza, 3500 sn once suresi dolmus (60 sn toleransin cok disinda)
+
+    def test_an_expired_validly_signed_token_is_not_accepted_under_any_invalid_wall_clock(self):
+        for bad in self.BAD_VALUES:
+            v, fetcher = _verifier_with_clocks(lambda bad=bad: bad)
+            with self.subTest(clock=repr(bad)[:24]):
+                self.deny(v, self.expired(), "VERIFIER_CLOCK_INVALID", 503)
+
+    def test_a_fresh_validly_signed_token_is_also_not_accepted_under_an_invalid_wall_clock(self):
+        for bad in self.BAD_VALUES:
+            v, fetcher = _verifier_with_clocks(lambda bad=bad: bad)
+            with self.subTest(clock=repr(bad)[:24]):
+                self.deny(v, mint(), "VERIFIER_CLOCK_INVALID", 503)
+
+    def test_a_clock_that_raises_fails_closed_with_the_same_code(self):
+        for exc in (RuntimeError("boom"), ValueError("x"), OverflowError("x"), TypeError("x"), OSError("x")):
+            def clock(exc=exc):
+                raise exc
+            v, fetcher = _verifier_with_clocks(clock)
+            with self.subTest(exc=type(exc).__name__):
+                self.deny(v, mint(), "VERIFIER_CLOCK_INVALID", 503)
+
+    def test_the_clock_failure_is_a_known_code_and_is_logged_without_any_token_data(self):
+        self.assertIn("VERIFIER_CLOCK_INVALID", oidc.ERROR_CODES)
+        tok = mint(sub="SENSITIVE-SUB-XYZ", jti="SENSITIVE-JTI-777")
+        v, fetcher = _verifier_with_clocks(lambda: float("nan"))
+        with self.assertLogs("app.auth.oidc", level="DEBUG") as cm:
+            self.deny(v, tok, "VERIFIER_CLOCK_INVALID", 503)
+        text = "\n".join(cm.output)
+        self.assertIn("VERIFIER_CLOCK_INVALID", text)
+        for secret in (tok, tok.split(".")[0], tok.split(".")[1], tok.split(".")[2], "SENSITIVE-SUB-XYZ", "SENSITIVE-JTI-777"):
+            self.assertNotIn(secret, text)
+
+    def test_a_bad_clock_does_not_hide_an_ordinary_token_error(self):
+        v, fetcher = _verifier_with_clocks(lambda: float("nan"))
+        self.deny(v, "not-a-token", "TOKEN_MALFORMED")
+        self.deny(v, mint(headers={"typ": "JWT"}), "TOKEN_TYPE_NOT_ACCESS")
+        self.deny(v, mint()[:-4] + "AAAA", "TOKEN_SIGNATURE_INVALID")
+
+    def test_a_valid_clock_behaves_exactly_as_before_int_float_and_the_60_second_boundary(self):
+        for clock_value in (T0, int(T0), T0 + 0.25):
+            v, fetcher = _verifier_with_clocks(lambda c=clock_value: c)
+            with self.subTest(clock=clock_value):
+                self.assertEqual(v.verify(mint()).subject, "user-123")
+                self.deny(v, mint(iat=T0 - 400, exp=T0 - 100), "TOKEN_EXPIRED")
+        v, _ = _verifier_with_clocks(lambda: T0)
+        self.deny(v, mint(iat=T0 - 400, exp=T0 - 60), "TOKEN_EXPIRED")
+        self.assertEqual(v.verify(mint(iat=T0 - 400, exp=T0 - 59)).subject, "user-123")
+        self.deny(v, mint(nbf=T0 + 61), "TOKEN_NOT_YET_VALID")
+        self.assertEqual(v.verify(mint(nbf=T0 + 60)).subject, "user-123")
+
+    def test_a_clock_at_the_edges_of_the_accepted_range_is_still_a_clock(self):
+        for edge in (0, 0.0, 4102444800, 4102444800.0):
+            v, _ = _verifier_with_clocks(lambda e=edge: e)
+            with self.subTest(clock=edge):
+                try:
+                    v.verify(mint())
+                except oidc.TokenError as exc:
+                    self.assertNotEqual(exc.code, "VERIFIER_CLOCK_INVALID")  # gecerli saat: jeton baska bir nedenle reddedilebilir
+
+    def test_an_untrustworthy_monotonic_clock_cannot_defeat_the_jwks_refresh_bounds(self):
+        # NaN/inf monotonik saat "yenileme araligi" ve "geri cekilme" karsilastirmalarini hep False yapar -> sinirsiz getirme.
+        for bad in (float("nan"), float("inf"), float("-inf"), -1, -0.5, 2 ** 54, True, None, "5", 10 ** 400, -(10 ** 400)):
+            fetcher = FakeFetcher()
+            v = oidc.OidcAccessTokenVerifier(oidc.OidcConfig(**BASE_CFG), fetcher=fetcher, clock=Clk(), monotonic=lambda bad=bad: bad)
+            with self.subTest(monotonic=repr(bad)[:24]):
+                for _ in range(5):
+                    self.deny(v, mint(), "VERIFIER_CLOCK_INVALID", 503)
+                self.assertEqual(fetcher.calls, 0)
+
+    def test_a_monotonic_clock_that_raises_fails_closed(self):
+        def mono():
+            raise RuntimeError("boom")
+        fetcher = FakeFetcher()
+        v = oidc.OidcAccessTokenVerifier(oidc.OidcConfig(**BASE_CFG), fetcher=fetcher, clock=Clk(), monotonic=mono)
+        self.deny(v, mint(), "VERIFIER_CLOCK_INVALID", 503)
+        self.assertEqual(fetcher.calls, 0)
+
+
+class _Raw(str):
+    """Test yardimcisi: JSON metnine oldugu gibi yazilacak sayi bicimi."""
+
+
+class V11_OversizedNumericDates(Base):
+    """F-02: exp/iat/nbf = 10**400 -> float() OverflowError -> VERIFIER_INTERNAL_ERROR/503. Veri hatasidir: TOKEN_CLAIM_INVALID/401."""
+
+    def setUp(self):
+        self.v, self.clk, self.f = make()
+
+    @staticmethod
+    def raw_payload(**fields):
+        """json.dumps'in yazmayacagi sayi bicimlerini (1e400, -1e400, NaN) dogrudan metin olarak kurar."""
+        base = claims()
+        parts = []
+        for k, val in {**base, **fields}.items():
+            parts.append('"%s":%s' % (k, val if isinstance(val, _Raw) else json.dumps(val)))
+        return ("{" + ",".join(parts) + "}").encode()
+
+    def test_huge_integers_are_claim_errors_not_internal_errors(self):
+        for val in (10 ** 400, -(10 ** 400), 10 ** 309, 10 ** 1000, 2 ** 1024, 2 ** 63, 2 ** 64, 10 ** 20, 4102444801):
+            for name in ("exp", "iat", "nbf"):
+                with self.subTest(claim=name, digits=len(str(abs(val)))):
+                    self.deny(self.v, mint(**{name: val}), "TOKEN_CLAIM_INVALID")
+
+    def test_the_overflow_is_not_reported_as_a_verifier_outage(self):
+        with self.assertRaises(oidc.TokenError) as cm:
+            self.v.verify(mint(exp=10 ** 400))
+        self.assertEqual(cm.exception.http_status, 401)
+        self.assertNotEqual(cm.exception.code, "VERIFIER_INTERNAL_ERROR")
+
+    def test_float_overflow_spellings_in_the_json_text_are_claim_errors(self):
+        for text in ("1e400", "-1e400", "1E999", "1.0e309", "NaN", "Infinity", "-Infinity", "1e308", "-0.0000001"):
+            for name in ("exp", "iat", "nbf"):
+                tok = forge({"alg": "RS256", "typ": "at+jwt", "kid": "rsa-a"}, self.raw_payload(**{name: _Raw(text)}), RSA_A)
+                with self.subTest(claim=name, text=text):
+                    self.deny(self.v, tok, "TOKEN_CLAIM_INVALID")
+
+    def test_auth_time_uses_the_same_numeric_rules(self):
+        for val in (10 ** 400, -(10 ** 400), 4102444801, float("nan"), -1):
+            with self.subTest(auth_time=repr(val)[:20]):
+                self.deny(self.v, mint(auth_time=val), "TOKEN_CLAIM_INVALID")
+
+    def test_integer_strings_longer_than_pythons_digit_limit_are_a_401_data_error(self):
+        # CPython (>= 3.11) 4300 haneden uzun tam sayi metnini cevirmeyi reddeder: yanit 401 kalir (503 degil).
+        tok = forge({"alg": "RS256", "typ": "at+jwt", "kid": "rsa-a"}, self.raw_payload(exp=_Raw("9" * 5000)), RSA_A)
+        with self.assertRaises(oidc.TokenError) as cm:
+            self.v.verify(tok)
+        self.assertEqual(cm.exception.http_status, 401)
+        self.assertIn(cm.exception.code, ("TOKEN_MALFORMED", "TOKEN_CLAIM_INVALID"))
+
+    def test_valid_numeric_dates_and_the_60_second_tolerance_are_unchanged(self):
+        self.assertEqual(self.v.verify(mint(iat=int(T0) - 10, exp=int(T0) + 300, nbf=int(T0) - 10)).subject, "user-123")  # tam sayi
+        self.assertEqual(self.v.verify(mint(iat=T0 - 10.5, exp=T0 + 300.25, nbf=T0 - 10.5)).subject, "user-123")  # kesirli
+        self.deny(self.v, mint(iat=T0 - 400, exp=T0 - 60), "TOKEN_EXPIRED")
+        self.assertEqual(self.v.verify(mint(iat=T0 - 400, exp=T0 - 59)).subject, "user-123")
+        self.deny(self.v, mint(nbf=T0 + 61), "TOKEN_NOT_YET_VALID")
+        self.assertEqual(self.v.verify(mint(nbf=T0 + 60)).subject, "user-123")
+        self.assertEqual(self.v.verify(mint(iat=T0 + 60, exp=T0 + 360)).subject, "user-123")
+
+    def test_numeric_date_ceiling_is_exactly_the_documented_one(self):
+        self.assertEqual(oidc._num(4102444800), 4102444800.0)
+        self.assertEqual(oidc._num(0), 0.0)
+        self.assertEqual(oidc._num(1.5), 1.5)
+        for bad in (4102444801, 4102444800.5, -1, -0.5, 10 ** 400, float("nan"), float("inf"), True, "1", None):
+            with self.subTest(value=repr(bad)[:20]), self.assertRaises(oidc.TokenError) as cm:
+                oidc._num(bad)
+            self.assertEqual(cm.exception.code, "TOKEN_CLAIM_INVALID")
+            self.assertEqual(cm.exception.http_status, 401)
+
+
 if __name__ == "__main__":
     unittest.main()

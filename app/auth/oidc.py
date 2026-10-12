@@ -46,6 +46,7 @@ ALLOWED_ALGS = ("RS256", "ES256")
 FORBIDDEN_HEADER_PARAMS = frozenset({"jku", "x5u", "jwk", "x5c", "crit", "zip"})
 MAX_CLOCK_SKEW_SECONDS = 60
 _MAX_EPOCH = 4102444800  # 2100-01-01
+_MAX_MONOTONIC = 2 ** 53  # tam gosterilebilir tam sayi siniri
 _B64URL = re.compile(r"[A-Za-z0-9_-]*")  # her kullanim fullmatch: `$` sondaki satir sonunu kabul eder
 _KID = re.compile(r"[A-Za-z0-9._:~-]{1,128}")
 _HOST = re.compile(r"[a-z0-9]([a-z0-9.-]*[a-z0-9])?")
@@ -57,7 +58,7 @@ ERROR_CODES = frozenset({
     "TOKEN_HEADER_INVALID", "TOKEN_TYPE_NOT_ACCESS", "TOKEN_KID_MISSING", "TOKEN_KID_UNKNOWN", "TOKEN_KEY_MISMATCH",
     "TOKEN_SIGNATURE_INVALID", "TOKEN_CLAIM_MISSING", "TOKEN_CLAIM_INVALID", "TOKEN_ISSUER_INVALID",
     "TOKEN_AUDIENCE_INVALID", "TOKEN_EXPIRED", "TOKEN_NOT_YET_VALID", "TOKEN_LIFETIME_EXCEEDED",
-    "JWKS_UNAVAILABLE", "VERIFIER_INTERNAL_ERROR",
+    "JWKS_UNAVAILABLE", "VERIFIER_CLOCK_INVALID", "VERIFIER_INTERNAL_ERROR",
 })
 
 
@@ -351,12 +352,26 @@ def _decode_header(h64: str) -> dict:
 
 
 def _num(value: Any) -> float:
+    """NumericDate. Aralik, float'a CEVIRMEDEN once denetlenir: `float(10**400)` OverflowError verirdi (bu bir veri hatasidir, 401)."""
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise TokenError("TOKEN_CLAIM_INVALID")
-    v = float(value)
-    if math.isnan(v) or math.isinf(v) or v < 0 or v > _MAX_EPOCH:
+    if isinstance(value, float) and not math.isfinite(value):
         raise TokenError("TOKEN_CLAIM_INVALID")
-    return v
+    if value < 0 or value > _MAX_EPOCH:  # int/float karsilastirmasi tam ve tasmasizdir
+        raise TokenError("TOKEN_CLAIM_INVALID")
+    return float(value)
+
+
+def _reading(read: Callable[[], Any], lo: float, hi: float) -> float:
+    """Enjekte edilen saatin okumasi. Guvenilmez saat (NaN/Inf, aralik disi, sayi olmayan, istisna) = dogrulayici sorunu:
+    karsilastirmalar NaN ile hep False olup suresi dolmus jetonu kabul ettirirdi. Hata kodu sabittir; deger/jeton icermez."""
+    try:
+        v = read()
+    except Exception:
+        raise TokenError("VERIFIER_CLOCK_INVALID", 503) from None
+    if isinstance(v, bool) or not isinstance(v, (int, float)) or (isinstance(v, float) and not math.isfinite(v)) or v < lo or v > hi:
+        raise TokenError("VERIFIER_CLOCK_INVALID", 503)
+    return float(v)
 
 
 def _opt_str(payload: dict, name: str, max_len: int) -> Optional[str]:
@@ -421,7 +436,7 @@ class OidcAccessTokenVerifier:
             raise TokenError("TOKEN_MALFORMED") from None
         except jwt.PyJWTError:
             raise TokenError("TOKEN_SIGNATURE_INVALID") from None
-        return self._validate_claims(payload, float(self._clock()))
+        return self._validate_claims(payload, _reading(self._clock, 0, _MAX_EPOCH))
 
     def _parse_header(self, token: Any) -> dict:
         cfg = self._cfg
@@ -515,7 +530,7 @@ class OidcAccessTokenVerifier:
     def _get_key(self, kid: str) -> _Key:
         cfg = self._cfg
         with self._lock:
-            now = self._mono()
+            now = _reading(self._mono, 0, _MAX_MONOTONIC)
             age = None if self._loaded_at is None else now - self._loaded_at
             fresh = age is not None and age <= cfg.jwks_ttl_seconds
             if fresh:
